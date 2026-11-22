@@ -125,7 +125,10 @@ export class BaileysAdapter implements WhatsAppAdapter {
           session.loggedOut = true
           void persist().catch(() => {})
           notify({ type: 'loggedOut' })
+        } else if (status === DisconnectReason.connectionReplaced) {
+          notify({ type: 'blocked' })
         } else {
+          // restartRequired also uses the retry path to reopen with the saved pairing credentials.
           notify({ type: 'disconnected' })
         }
       }

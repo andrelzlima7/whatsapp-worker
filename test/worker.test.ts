@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import { test, type TestContext } from 'node:test'
 import { promisify } from 'node:util'
+import { DisconnectReason } from '@whiskeysockets/baileys'
 import { buildApp } from '../src/app.js'
 import { BaileysAdapter } from '../src/baileys.js'
 import { Connection, type WhatsAppAdapter, type WhatsAppSocket } from '../src/connection.js'
@@ -122,7 +123,7 @@ test('grupos são consultados novamente e a falha não vira lista vazia', async 
   assert.deepEqual((await get()).json(), { groups: [] })
 })
 
-test('adaptador restaura credenciais e chaves e mantém desvinculação após reinício', async t => {
+test('adaptador restaura credenciais e aguarda novo pareamento após loggedOut', async t => {
   const dir = await directory(t)
   type Factory = NonNullable<ConstructorParameters<typeof BaileysAdapter>[1]>
   let auth!: Parameters<Factory>[0]['auth']
@@ -147,7 +148,9 @@ test('adaptador restaura credenciais e chaves e mantém desvinculação após re
   const id = first.snapshot().connectionId
   await first.close()
 
-  const resumed = new Connection(new BaileysAdapter(dir, factory))
+  const resumed = new Connection(new BaileysAdapter(dir, factory), undefined, () => {
+    assert.fail('loggedOut não deve agendar reconexão')
+  })
   await resumed.start()
   assert.equal(auth.creds.registered, true)
   assert.equal(auth.creds.me?.id, '987@s.whatsapp.net')
@@ -155,7 +158,10 @@ test('adaptador restaura credenciais e chaves e mantém desvinculação após re
   emit('connection.update', { connection: 'open' })
   assert.equal(resumed.snapshot().status, 'CONNECTED')
   assert.notEqual(resumed.snapshot().connectionId, id)
-  emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } })
+  emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: DisconnectReason.loggedOut } } },
+  })
   assert.equal(resumed.snapshot().status, 'LOGGED_OUT')
   await resumed.close()
 
@@ -171,6 +177,70 @@ test('adaptador restaura credenciais e chaves e mantém desvinculação após re
   emit('connection.update', { qr: 'novo-qr-de-teste' })
   assert.equal(pairing.snapshot().status, 'AWAITING_QR')
   await pairing.close()
+})
+
+test('adaptador reconecta com espera progressiva no pareamento e bloqueia sessão substituída', async t => {
+  const dir = await directory(t)
+  type Factory = NonNullable<ConstructorParameters<typeof BaileysAdapter>[1]>
+  const retries: { callback: () => void; delay: number }[] = []
+  let socketReady: () => void = () => {}
+  let onConnectionUpdate!: (update: unknown) => void
+  let onCredentialsUpdate!: (update: unknown) => void
+  let auth!: Parameters<Factory>[0]['auth']
+  let sockets = 0
+  const factory: Factory = config => {
+    sockets++
+    auth = config.auth
+    return {
+      ev: {
+        on(name: string, callback: (update: unknown) => void) {
+          if (name === 'connection.update') {
+            onConnectionUpdate = callback
+            socketReady()
+          }
+          if (name === 'creds.update') onCredentialsUpdate = callback
+        },
+      },
+      end: async () => {},
+    } as unknown as ReturnType<Factory>
+  }
+  const connection = new Connection(new BaileysAdapter(dir, factory), undefined, (callback, delay) => {
+    retries.push({ callback, delay })
+    return () => {}
+  })
+  t.after(() => connection.close())
+  const disconnect = (statusCode: DisconnectReason) => onConnectionUpdate({
+    connection: 'close', lastDisconnect: { error: { output: { statusCode } } },
+  })
+  const reconnect = async (index: number, delay: number) => {
+    assert.equal(retries.length, index + 1)
+    assert.equal(retries[index].delay, delay)
+    const ready = new Promise<void>(resolve => { socketReady = resolve })
+    retries[index].callback()
+    await ready
+    await setImmediate()
+    assert.equal(auth.creds.registered, true)
+  }
+
+  await connection.start()
+  onConnectionUpdate({ qr: 'qr-de-teste' })
+  assert.equal(connection.snapshot().status, 'AWAITING_QR')
+  onCredentialsUpdate({ registered: true })
+  disconnect(DisconnectReason.restartRequired)
+  assert.equal(connection.snapshot().status, 'DISCONNECTED')
+  assert.throws(() => connection.qrCode(), { code: 'QR_UNAVAILABLE' })
+  await reconnect(0, 1000)
+  disconnect(DisconnectReason.connectionLost)
+  assert.equal(connection.snapshot().status, 'DISCONNECTED')
+  await reconnect(1, 2000)
+  onConnectionUpdate({ connection: 'open' })
+  assert.equal(connection.snapshot().status, 'CONNECTED')
+  disconnect(DisconnectReason.connectionReplaced)
+  assert.deepEqual(connection.snapshot(), { status: 'BLOCKED', connectionId: null })
+  assert.throws(() => connection.currentSocket(), { code: 'SESSION_BLOCKED' })
+  assert.throws(() => connection.pair(), { code: 'PAIRING_NOT_ALLOWED' })
+  assert.equal(retries.length, 2)
+  assert.equal(sockets, 3)
 })
 
 test('reproduz confirmação após reinício e vencimento, inclusive com fuso equivalente', async t => {

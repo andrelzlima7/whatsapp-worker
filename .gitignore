@@ -1,4 +1,11 @@
+/node_modules/
+/dist/
+/data/
+/.env*
+
+# Dados e artefatos locais do layout anterior
 /whatsapp-worker/node_modules/
+/whatsapp-worker/node_modules.initial/
 /whatsapp-worker/dist/
 /whatsapp-worker/data/
 /whatsapp-worker/.env*
