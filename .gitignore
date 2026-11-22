@@ -1,0 +1,4 @@
+/whatsapp-worker/node_modules/
+/whatsapp-worker/dist/
+/whatsapp-worker/data/
+/whatsapp-worker/.env*
